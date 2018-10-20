@@ -1,3 +1,7 @@
+// rctx by Rodizio
+// Based on JS2Serial by Oliver Mueller and wbc all-in-one tx by Anemostec.
+// Thanks to dino_de for the Joystick switches and mavlink code
+// Licensed under GPL2
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/resource.h>
@@ -6,7 +10,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <pcap.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <netpacket/packet.h>
@@ -14,32 +17,95 @@
 #include <netinet/ether.h>
 #include <arpa/inet.h>
 #include <string.h>
-#include <pcap.h>
 #include <getopt.h>
 #include "lib.h"
 
 #include "/tmp/rctx.h"
 
 #define UPDATE_INTERVAL 2000 // read Joystick every 2 ms or 500x per second
-#define UPDATE_NTH_TIME 6 // send out data every 6th time or every 12ms or 83.333x per second
 #define JOY_CHECK_NTH_TIME 400 // check if joystick disconnected every 400th time or 200ms or 5x per second
 #define JOYSTICK_N 0
 #define JOY_DEV "/sys/class/input/js0"
 
-static int16_t rcData[8]; // interval [1000;2000]
+#ifdef JSSWITCHES  // 1 byte more for channels 9 - 16 as switches
+
+	static uint16_t *rcData = NULL;
+
+	uint16_t *rc_channels_memory_open(void) {
+
+		int fd = shm_open("/wifibroadcast_rc_channels", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+
+		if(fd < 0) {
+			fprintf(stderr,"rc shm_open\n");
+			exit(1);
+		}
+
+		if (ftruncate(fd, 9 * sizeof(uint16_t)) == -1) {
+			fprintf(stderr,"rc ftruncate\n");
+			exit(1);
+		}
+
+		void *retval = mmap(NULL, 9 * sizeof(uint16_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (retval == MAP_FAILED) {
+			fprintf(stderr,"rc mmap\n");
+			exit(1);
+		}
+
+	return (uint16_t *)retval;
+	}
+#else
+	static uint16_t rcData[8]; // interval [1000;2000]
+#endif
+
 static SDL_Joystick *js;
-
 char *ifname = NULL;
-
 int flagHelp = 0;
-
 int sock = 0;
 int socks[5];
+
+struct framedata_s {
+    // 88 bits of data (11 bits per channel * 8 channels) = 11 bytes
+    uint8_t rt1;
+    uint8_t rt2;
+    uint8_t rt3;
+    uint8_t rt4;
+    uint8_t rt5;
+    uint8_t rt6;
+    uint8_t rt7;
+    uint8_t rt8;
+
+    uint8_t rt9;
+    uint8_t rt10;
+    uint8_t rt11;
+    uint8_t rt12;
+
+    uint8_t fc1;
+    uint8_t fc2;
+    uint8_t dur1;
+    uint8_t dur2;
+
+    uint8_t seqnumber;
+
+    unsigned int chan1 : 11;
+    unsigned int chan2 : 11;
+    unsigned int chan3 : 11;
+    unsigned int chan4 : 11;
+    unsigned int chan5 : 11;
+    unsigned int chan6 : 11;
+    unsigned int chan7 : 11;
+    unsigned int chan8 : 11;
+#ifdef JSSWITCHES
+    unsigned int switches : JSSWITCHES; // 8 or 16 bits for rc channels 9 - 16/24  as switches
+#endif
+} __attribute__ ((__packed__));
+
+struct framedata_s framedata;
+
 
 void usage(void)
 {
     printf(
-        "rctx by Rodizio. Based on JS2Serial by Oliver Mueller and wbc all-in-one tx by Anemostec\n"
+        "rctx by Rodizio. Based on JS2Serial by Oliver Mueller and wbc all-in-one tx by Anemostec. GPL2\n"
         "\n"
         "Usage: rctx <interfaces>\n"
         "\n"
@@ -49,12 +115,11 @@ void usage(void)
     exit(1);
 }
 
-
 static int open_sock (char *ifname) {
     struct sockaddr_ll ll_addr;
     struct ifreq ifr;
 
-    sock = socket (PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    sock = socket (AF_PACKET, SOCK_RAW, 0);
     if (sock == -1) {
 	fprintf(stderr, "Error:\tSocket failed\n");
 	exit(1);
@@ -144,7 +209,21 @@ static int eventloop_joystick (void) {
 			readAxis(&event);
 			return 2;
 			break;
-		case SDL_QUIT:
+#ifdef	JSSWITCHES  // channels 9 - 16 as switches
+		case SDL_JOYBUTTONDOWN:
+			if (event.jbutton.button < JSSWITCHES) { // newer Taranis software can send 24 buttons - we use 16
+				rcData[8] |= 1 << event.jbutton.button;
+			}
+			return 5;
+			break;
+		case SDL_JOYBUTTONUP:
+			if (event.jbutton.button < JSSWITCHES) {
+				rcData[8] &= ~(1 << event.jbutton.button);
+			}
+			return 4;
+			break;
+#endif
+			case SDL_QUIT:
 			return 0;
     }
     usleep(100);
@@ -155,107 +234,51 @@ static int eventloop_joystick (void) {
 void sendRC(unsigned char seqno, telemetry_data_t *td) {
     uint8_t i;
     uint8_t z;
-    uint8_t checksum=0;
-    checksum^=16;
-    checksum^=200;
 
-	struct framedata_s {
-	    // 88 bits of data (11 bits per channel * 8 channels) = 11 bytes
-	    uint8_t rt1;
-	    uint8_t rt2;
-	    uint8_t rt3;
-	    uint8_t rt4;
-	    uint8_t rt5;
-	    uint8_t rt6;
-	    uint8_t rt7;
-	    uint8_t rt8;
-
-	    uint8_t rt9;
-	    uint8_t rt10;
-	    uint8_t rt11;
-	    uint8_t rt12;
-
-	    uint8_t fc1;
-	    uint8_t fc2;
-	    uint8_t dur1;
-	    uint8_t dur2;
-
-	    uint8_t seqnumber;
-
-	    unsigned int chan1 : 11;
-	    unsigned int chan2 : 11;
-	    unsigned int chan3 : 11;
-	    unsigned int chan4 : 11;
-	    unsigned int chan5 : 11;
-	    unsigned int chan6 : 11;
-	    unsigned int chan7 : 11;
-	    unsigned int chan8 : 11;
-	}  __attribute__ ((__packed__));
-
-	struct framedata_s framedata;
-
-	framedata.rt1 = 0; // <-- radiotap version
-	framedata.rt2 = 0; // <-- radiotap version
-
-	framedata.rt3 = 12; // <- radiotap header length
-	framedata.rt4 = 0; // <- radiotap header length
-
-	framedata.rt5 = 4; // <-- radiotap present flags
-	framedata.rt6 = 128; // <-- radiotap present flags
-	framedata.rt7 = 0; // <-- radiotap present flags
-	framedata.rt8 = 0; // <-- radiotap present flags
-
-	framedata.rt9 = 24; // <-- radiotap rate
-	framedata.rt10 = 0; // <-- radiotap stuff
-	framedata.rt11 = 0; // <-- radiotap stuff
-	framedata.rt12 = 0; // <-- radiotap stuff
-
-	framedata.fc1 = 180; // <-- frame control field
-	framedata.fc2 = 191; // <-- frame control field
-	framedata.dur1 = 0; // <-- duration
-	framedata.dur2 = 0; // <-- duration
-
-	framedata.seqnumber = seqno;
-
-	framedata.chan1 = rcData[0];
-	framedata.chan2 = rcData[1];
-	framedata.chan3 = rcData[2];
-	framedata.chan4 = rcData[3];
-	framedata.chan5 = rcData[4];
-	framedata.chan6 = rcData[5];
-	framedata.chan7 = rcData[6];
-	framedata.chan8 = rcData[7];
-
-//	printf ("rcdata0:%d\n",rcData[0]);
+    framedata.seqnumber = seqno;
+    framedata.chan1 = rcData[0];
+    framedata.chan2 = rcData[1];
+    framedata.chan3 = rcData[2];
+    framedata.chan4 = rcData[3];
+    framedata.chan5 = rcData[4];
+    framedata.chan6 = rcData[5];
+    framedata.chan7 = rcData[6];
+    framedata.chan8 = rcData[7];
+#ifdef JSSWITCHES
+	framedata.switches = rcData[8];	/// channels 9 - 24 as switches
+//	printf ("rcdata0:%x\t",rcData[8]);
+#endif
+//  printf ("rcdata0:%d\n",rcData[0]);
 
     int best_adapter = 0;
-
     if(td->rx_status != NULL) {
-	int i;
+	int j = 0;
 	int ac = td->rx_status->wifi_adapter_cnt;
 	int best_dbm = -1000;
 
-	// find out which card has best signal  and ignore ralink (type=1) ones
-	for(i=0; i<ac; ++i) {
-	    if ((best_dbm < td->rx_status->adapter[i].current_signal_dbm)&&(td->rx_status->adapter[i].type == 0)) {
-		best_dbm = td->rx_status->adapter[i].current_signal_dbm;
-		best_adapter = i;
+	// find out which card has best signal and ignore ralink (type=1) ones
+	for(j=0; j<ac; ++j) {
+	    if ((best_dbm < td->rx_status->adapter[j].current_signal_dbm)&&(td->rx_status->adapter[j].type == 0)) {
+		best_dbm = td->rx_status->adapter[j].current_signal_dbm;
+		best_adapter = j;
+		//printf ("best_adapter: :%d\n",best_adapter);
 	    }
 	}
 //	printf ("bestadapter: %d (%d dbm)\n",best_adapter, best_dbm);
+	if (write(socks[best_adapter], &framedata, sizeof(framedata)) < 0 ) fprintf(stderr, "!");	/// framedata_s = 28 or 29 bytes
+    } else {
+	printf ("ERROR: Could not open rx status memory!");
     }
-    if (write(socks[best_adapter], &framedata, 28) < 0 ) fprintf(stderr, "!");
 }
 
 
 
 wifibroadcast_rx_status_t *telemetry_wbc_status_memory_open(void) {
-
     int fd = 0;
     int sharedmem = 0;
 
     while(sharedmem == 0) {
-        fd = shm_open("/wifibroadcast_rx_status_0", O_RDWR, S_IRUSR | S_IWUSR);
+        fd = shm_open("/wifibroadcast_rx_status_0", O_RDONLY, S_IRUSR | S_IWUSR);
 	    if(fd < 0) {
 		fprintf(stderr, "Could not open wifibroadcast rx status - will try again ...\n");
 	    } else {
@@ -264,12 +287,12 @@ wifibroadcast_rx_status_t *telemetry_wbc_status_memory_open(void) {
 	    usleep(100000);
     }
 
-        if (ftruncate(fd, sizeof(wifibroadcast_rx_status_t)) == -1) {
-                perror("ftruncate");
-                exit(1);
-        }
+//        if (ftruncate(fd, sizeof(wifibroadcast_rx_status_t)) == -1) {
+//                perror("ftruncate");
+//                exit(1);
+//        }
 
-        void *retval = mmap(NULL, sizeof(wifibroadcast_rx_status_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        void *retval = mmap(NULL, sizeof(wifibroadcast_rx_status_t), PROT_READ, MAP_SHARED, fd, 0);
         if (retval == MAP_FAILED) {
                 perror("mmap");
                 exit(1);
@@ -280,19 +303,17 @@ wifibroadcast_rx_status_t *telemetry_wbc_status_memory_open(void) {
 return 0;
 }
 
+
 void telemetry_init(telemetry_data_t *td) {
     td->rx_status = telemetry_wbc_status_memory_open();
 }
 
 
-
-
 int main (int argc, char *argv[]) {
-    pcap_t *ppcap = NULL;
-    char szErrbuf[PCAP_ERRBUF_SIZE];
     int done = 1;
     int joy_connected = 0;
     int joy = 1;
+    int update_nth_time = 0;
 
     while (1) {
 	int nOptionIndex;
@@ -330,6 +351,27 @@ int main (int argc, char *argv[]) {
 	usleep(20000); // wait a bit between configuring interfaces to reduce Atheros and Pi USB flakiness
     }
 
+	framedata.rt1 = 0; // <-- radiotap version
+	framedata.rt2 = 0; // <-- radiotap version
+
+	framedata.rt3 = 12; // <- radiotap header length
+	framedata.rt4 = 0; // <- radiotap header length
+
+	framedata.rt5 = 4; // <-- radiotap present flags
+	framedata.rt6 = 128; // <-- radiotap present flags
+	framedata.rt7 = 0; // <-- radiotap present flags
+	framedata.rt8 = 0; // <-- radiotap present flags
+
+	framedata.rt9 = 24; // <-- radiotap rate
+	framedata.rt10 = 0; // <-- radiotap stuff
+	framedata.rt11 = 0; // <-- radiotap stuff
+	framedata.rt12 = 0; // <-- radiotap stuff
+
+	framedata.fc1 = 180; // <-- frame control field (0xb4)
+	framedata.fc2 = 191; // <-- frame control field (0xbf)
+	framedata.dur1 = 0; // <-- duration
+	framedata.dur2 = 0; // <-- duration
+
 	fprintf(stderr, "Waiting for joystick ...");
 	while (joy) {
 	    joy_connected=access(JOY_DEV, F_OK);
@@ -343,6 +385,10 @@ int main (int argc, char *argv[]) {
 
 	// we need to prefill channels since we have no values for them as
 	// long as the corresponding axis has not been moved yet
+#ifdef	JSSWITCHES
+	rcData = rc_channels_memory_open();
+	rcData[8]=0;		/// switches
+#endif
 	rcData[0]=AXIS0_INITIAL;
 	rcData[1]=AXIS1_INITIAL;
 	rcData[2]=AXIS2_INITIAL;
@@ -377,12 +423,16 @@ int main (int argc, char *argv[]) {
 
 	int counter = 0;
 	int seqno = 0;
+	int k = 0;
 	while (done) {
-		done = eventloop_joystick ();
+		done = eventloop_joystick();
 //		fprintf(stderr, "eventloop_joystick\n");
 		if (counter % UPDATE_NTH_TIME == 0) {
 //		    fprintf(stderr, "SendRC\n");
-		    sendRC(seqno,&td);
+		    for(k=0; k < TRANSMISSIONS; ++k) {
+			sendRC(seqno,&td);
+			usleep(2000); // wait 2ms between sending multiple frames to lower collision probability
+		    }
 		    seqno++;
 		}
 		if (counter % JOY_CHECK_NTH_TIME == 0) {
