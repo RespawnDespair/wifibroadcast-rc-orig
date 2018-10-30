@@ -27,7 +27,7 @@
 #define JOYSTICK_N 0
 #define JOY_DEV "/sys/class/input/js0"
 
-#ifdef JSSWITCHES  // 1 byte more for channels 9 - 16 as switches
+#ifdef JSSWITCHES  // 1 or 2 byte more for channels 9 - 16/24 as switches
 
 	static uint16_t *rcData = NULL;
 
